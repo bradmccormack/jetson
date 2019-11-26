@@ -119,18 +119,17 @@ function setup_partition_table()
 	echo "Calculating disk size."
 	DISK_SIZE=$(lsblk /dev/sda --output SIZE | grep -v SIZE | cut -d'G' -f1)
 
-	SWAP_SIZE=$(echo ${DISK_SIZE}*${ALLOC_SWAP_SIZE_PERCENT}/100 | bc)
+	SWAP_SIZE=$(echo ${DISK_SIZE}*${ALLOC_SWAP_SIZE_PERCENT}/100 | bc --mathlib)
 
 	# Limit the swap size to 8GB maximum.
-	if (( SWAP_SIZE > SWAP_SIZE_MAX_GB )); then
+	if (( $(echo "SWAP_SIZE > SWAP_SIZE_MAX_GB" | bc --mathlib) )); then
 		printf "\nSwap size maxium is %.2fGB. Limit applied.\n" "${MAX_SWAP_SIZE_GB}"
 		SWAP_SIZE=${MAX_SWAP_SIZE_GB}
 		# FIX THIS
 		ROOT_SIZE=$((DISK_SIZE-MAX_SWAP_SIZE_GB))
 	else
-		ROOT_SIZE=$(echo "${DISK_SIZE}*(1-(${ALLOC_SWAP_SIZE_PERCENT})/100)" | bc)
+		ROOT_SIZE=$(echo "${DISK_SIZE}*(1-(${ALLOC_SWAP_SIZE_PERCENT})/100)" | bc --mathlib)
 	fi
-
 
 	printf "\nDisk size is %.2fGB\n" "${DISK_SIZE}"
 	printf "\nUsing %.2fGB for root and %.2fGB for swap.\n" "${ROOT_SIZE}" "${SWAP_SIZE}"	
