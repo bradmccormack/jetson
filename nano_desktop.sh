@@ -5,11 +5,10 @@
 # Inspired by - https://syonyk.blogspot.com/2019/04/nvidia-jetson-nano-desktop-use-kernel-builds.html?m=1
 
 # TODO 
-# - Auto-detect if kernel part is done and run migrate.
 # - Enforce environment variables or arguments or add prompts so options are confirmed / safe and desired by the user.
 # - Improve output
 # - Check after the rsync is complete (basic check of du etc) or consider doing a SHA check on source and dest.
-# - Prompts / confirmations for dangerous actions.
+# - Support Raspberry Pi (ODroid too possibly).
 
 DEV=/dev/sda
 
@@ -101,10 +100,14 @@ function build_kernel()
 function install_kernel()
 {
 	# Back up the old kernel.
-	sudo cp /boot/Image /boot/Image.dist
+	sudo cp /boot/Image /boot/Image.backup
 
 	# Copy the new kernel into the boot directory.
 	sudo cp arch/arm64/boot/Image /boot
+
+	# Replace the default /boot/extlinux.conf file with the one in this repository that allows booting from the stock or custom kernel.
+	# TODO - generate the stock kernel line dynamically should Nvidia change their kernel version.
+	sudo cp boot/Nvidia/extlinux.conf.custom /boot/extlinux/extlinux.conf
 }
 
 # Sets up the partition table.
@@ -190,40 +193,15 @@ function setup_partition_table()
 
 	# Create GPT partition table.
 	sudo parted --script "${DEV}" mklabel gpt 1>/dev/null
-
-	# Strip off the device suffix.
-	DEV_NUMBER="$(echo ${DEV} | cut -d'/' -f3)"
-
-	# https://rainbow.chard.org/2013/01/30/how-to-align-partitions-for-best-performance-using-parted/ - credit
-	# Calculate alignment for the new partitions (specifying --align=opt doesn't appear to work)
-	OPTIMAL_IO_SIZE="$(cat /sys/block/${DEV_NUMBER}/queue/optimal_io_size)"
 	
-	if [ -n ${OPTIMAL_IO_SIZE} ]; then
-		MINIMUM_IO_SIZE="$(cat /sys/block/${DEV_NUMBER}/queue/minimum_io_size)"
-		ALIGNMENT_OFFSET="$(cat /sys/block/${DEV_NUMBER}/alignment_offset)"
-		PHYSICAL_BLOCK_SIZE="$(cat /sys/block/${DEV_NUMBER}/queue/physical_block_size)"
-
-		SECTOR_START="$(echo "(${OPTIMAL_IO_SIZE} + ${ALIGNMENT_OFFSET}) / ${PHYSICAL_BLOCK_SIZE}" | bc -l)" 
-		SECTOR_START="$(printf "%.0f" ${SECTOR_START})"
-		printf "\nPartition alignment - optimal sector %d starting offset found - using.\n" "${SECTOR_START}"
-	else
-		SECTOR_START=0
-		printf "\nCouldn't determine optimal alignment for partition. Not aligning.\n"
-	fi	
-
-	set -x
-	# Create the swap partition (aligned).
+	# Create the swap partition (aligned - using 0% as the start makes parted calculate the aligned start sector).
 	sudo parted --script --align=optimal "${DEV}" mkpart SWAP linux-swap 0% "${SWAP_SIZE_GB}G"
 
 	# Create the root partition (aligned).
-	sudo parted --script --align=optimal "${DEV}" mkpart ROOT ext2 "${SWAP_SIZE_GB}G" 100%
+	sudo parted --script --align=optimal "${DEV}" mkpart ROOT ext4 100%
 
 	# Notify the kernel of partition table change.
 	sudo partprobe
-	
-	set +x
-
-	exit 0
 }
 
 
@@ -239,18 +217,23 @@ function setup_filesystem()
 	
 	# TODO confirm if ext4 is the best for this ARM SOC (Check XFS / JFS etc).
 	printf "Making root filesystem ...\n"
-	sudo mkfs.ext4 "${DEV}1"
+	sudo mkfs.ext4 -F "${DEV}2"
 
-	printf "Making swap filesystem ...\n"
-	sudo mkswap "${DEV}2"
-	
+	printf "Making and mounting swap ...\n"
+	sudo mkswap "${DEV}1"
+	sudo swapon "${DEV}1"
+
 	printf "Mounting filesystems ready for copy ...\n"
-	sudo mkdir /mnt/root
-	sudo mount "${DEV}1" /mnt/root
-	sudo mkdir /mnt/root/proc
+	sudo mkdir -p /mnt/root
+	sudo mount "${DEV}2" /mnt/root
+
+	sudo mkdir -p /mnt/root/proc
 
 	# Sync the current root file system onto the new device.
-	sudo apt -y install rsync
+	if ! which rsync; then
+		sudo apt -y install rsync 1>/dev/null
+	fi
+	
 	sudo rsync -axHAWX --numeric-ids --info=progress2 --exclude=/proc / /mnt/root
 }
 
@@ -264,14 +247,15 @@ function setup_boot_swap()
 
 	DEV="${1}"
 
-	sudo sed -i "s/mmcblk0p1/${DEV}1/" /boot/extlinux/extlinux.conf
-	sudo sed -i "s/rootwait/rootwait zswap.enabled=1/" /boot/extlinux/extlinux.conf
-	printf "\nUpdated boot config to boot from %s." "${DEV}1"
+	# Note triple check everything before enabling this as future booting will not work if I break it.
+	#sudo sed -i "s/mmcblk0p1/${DEV}2/" /boot/extlinux/extlinux.conf
+	#sudo sed -i "s/rootwait/rootwait zswap.enabled=1/" /boot/extlinux/extlinux.conf
+	printf "\nUpdated boot config to boot from %s." "${DEV}2"
 
-	echo "/dev/${DEV}2            none                  swap           \
+	echo "/dev/${DEV}1            none                  swap           \
 		defaults                                     0 1" | sudo tee -a /etc/fstab
 
-	printf "\nUpdated /etc/fstab to mount swap at %s." "${DEV}2"
+	printf "\nUpdated /etc/fstab to mount swap at %s." "${DEV}1"
 }
 
 
@@ -357,6 +341,17 @@ function abort()
 		rm -rf "{KERNEL_SOURCE_PATH}"
 	fi
 
+	# TODO sigterm all child processes so we don't leave mess.
+	sudo kill $(ps -s $$ -o pid=)
+
+	# Attempt to cleanly kill any stray rsync processes
+	# TODO - ensure that we are the parent of them so we don't kill rsync started by another app.
+	#sudo kill -s SIGTERM $(pidof rsync)
+	#sleep 1
+	# Kill any remaining.
+	#sudo kill -s SIGKILL $(pidof rsync)
+
+
 	# TODO get the original state of the error option and don't just assume this script knows best.
 	set +e
 	echo "Aborted."
@@ -420,8 +415,6 @@ else
 		fi
 	fi
 
-
-	exit 0
 
 	# Download source, patch, configure, compile and install the kernel.
 	setup_kernel
