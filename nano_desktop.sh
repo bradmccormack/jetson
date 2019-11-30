@@ -5,8 +5,7 @@
 # Inspired by - https://syonyk.blogspot.com/2019/04/nvidia-jetson-nano-desktop-use-kernel-builds.html?m=1
 
 # TODO 
-# - Setup the filesystem and partitions - mostly done
-# - Auto-detect if kernel part is done and run setup_root
+# - Auto-detect if kernel part is done and run migrate.
 # - Enforce environment variables or arguments or add prompts so options are confirmed / safe and desired by the user.
 # - Improve output
 # - Check after the rsync is complete (basic check of du etc) or consider doing a SHA check on source and dest.
@@ -19,7 +18,7 @@ function download_kernel_sources()
 {
 	if [ -z "${1}" ]; then
 		echo "No target specified to download to."
-		exit 1
+		return 1
 	fi
 
 	pushd "${1}"
@@ -98,27 +97,12 @@ function install_kernel()
 	sudo cp arch/arm64/boot/Image /boot
 }
 
-# Handles various interrupts to safely cleanup.
-function abort()
-{
-	echo "Caught signal."
-	if [ -n "${KERNEL_SOURCE_NO_DELETE}" ]; then
-		echo "KERNEL_SOURCE_NO_DELETE specified. Not cleaning up source."
-	else
-		echo "KERNEL_SOURCE_NO_DELETE not specified. Removing kernel source ..."
-		rm -rf "{KERNEL_SOURCE_PATH}"
-	fi
-
-	echo "Aborted."
-}
-
-
 # Sets up the partition table.
 function setup_partition_table()
 {
 	if [ -n "${1}" ]; then
 		printf "No target device specified.\n"
-		exit 1
+		return 1
 	fi
 
 	DEV="${1}"
@@ -139,11 +123,11 @@ function setup_partition_table()
 		# Ensure the specified device is large enough to support being a root + swap target.
 		if (( DISK_SIZE < MIN_DISK_SIZE_GB )); then
 			printf "\nThe specified device is too small.%dG is the minimium size supported.\n" "${MIN_DISK_SIZE_GB}"
-			exit 1
+			return 1
 		fi
 	else
 		printf "Couldn't find %s.\nAuto-detection not done. Please update script manually for now.\n" "${DEV}"
-		exit 1
+		return 1
 	fi
 
 
@@ -181,7 +165,7 @@ function setup_filesystem()
 {
 	if [ -n "${1}" ]; then
 		printf "No target device specified.\n"
-		exit 1
+		return  1
 	fi
 
 	DEV="${1}"
@@ -208,7 +192,7 @@ function setup_boot_swap()
 {
 	if [ -n "${1}" ]; then
 		printf "No target device specified.\n"
-		exit 1
+		return 1
 	fi
 
 	DEV="${1}"
@@ -228,16 +212,133 @@ function setup_boot_swap()
 function migrate() {
 	# TODO - detect if the current kernel is the custom one (or at least check the on-disk one
 	# and inform the user they should build the kernel first that supports Zswap.
-	setup_partition_table "${DEV}"
-	setup_filesystem "${DEV}"
-	setup_boot_swap "${DEV}"
+	
+	if ! setup_partition_table "${DEV}" ; then
+		echo "Couldn't set up partition table. Cancelled."
+		exit 1
+	fi
+
+	if ! setup_filesystem "${DEV}" ; then
+		echo "Couldn't set up filesystems. Cancelled."
+		exit 1
+	fi
+
+	if ! setup_boot_swap "${DEV}" ; then
+		echo "Couldn't set up boot and mount configuration. Cancelled."
+		exit 1
+	fi
+
 }
 
+# Provides an interactive prompt to the user
+# arg1 = The message to display
+# arg2 = The prompt to use
+prompt_for_verification()
+{
+  local default_message
+  local default_prompt
 
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  default_message="Are you sure?"
+  default_prompt="[y/n] >"
+
+  # Use the provided message or default to Are you sure ?
+  message="${1:-$default_message}"
+  printf "\\n%s \\n" "${message}"
+
+  # Use the provided prompt or default to [y/n]
+  prompt="${2:-$default_prompt}"
+
+  for (( ; ; ))
+  do
+    read -p "${prompt}" -r
+
+    if [[ ${REPLY} =~ ^[Yy]$ ]]
+    then
+      return 0
+    elif [[ ${REPLY} =~ ^[Nn]$ ]]
+    then
+      return 1
+    else
+      printf "\nInvalid input. Please enter only n/N or y/Y\n"
+    fi
+  # Keep looping while input is invalid.
+  done
+}
+
+# Handles various interrupts to safely cleanup.
+function abort()
+{
+	echo "Caught signal."
+	if [ -n "${KERNEL_SOURCE_NO_DELETE}" ]; then
+		echo "KERNEL_SOURCE_NO_DELETE specified. Not cleaning up source."
+	else
+		echo "KERNEL_SOURCE_NO_DELETE not specified. Removing kernel source ..."
+		rm -rf "{KERNEL_SOURCE_PATH}"
+	fi
+
+	# TODO get the original state of the error option and don't just assume this script knows best.
+	set +e
+	echo "Aborted."
+}
+
+# Check if the script is being executed with arguments or not.
+
+# If the user has specified arguments then they desire more granular control, otherwise automate the process.
+if [ -n "${1}" ]; then
+	# https://stackoverflow.com/a/16159057 - credit.
+
+	# Exand the arguments of the command line to try to call the function specified.
+
+	# Check if the function exists (Bash specific).
+	if declare -f "$1" > /dev/null; then
+		# call arguments verbatim
+		"${@}"
+	else
+		# Show error message as the function doesn't exist.
+		echo "'${1}' is not a known function name" >&2
+		exit 1
+	fi
+else
 	set -e
 
 	trap abort SIGHUP SIGINT SIGTERM
+
+	CUSTOM_KERNEL=0
+	
+	# Check if the current kernel that is running is the custom kernel or that a compiled custom one exists in /boot.
+	# If either is true, we can setup the target device as the kernel supports the requisite functionality.
+	if ! uname -r | grep tegra ; then
+		# The current running kernel is already custom.
+		# Assume the running kernel supports the features we need - TODO check features are enabled.
+		printf "\nThe current kernel is already custom. You don't need to re-compile (assuming it meets the requirements).\n"
+		CUSTOM_KERNEL=1
+	else
+		# Attempt to find the version from the kernel image on disk.
+
+		# (No tools such as mk-image or 'file' returned the kernel version from the image. Find it using grep).
+		KERNEL_VERSION=$(grep -a 'Linux version' -m1 /boot/Image | cut -d' ' -f3)
+	        printf "\nThe on-disk kernel image shows version %s.\n" "${KERNEL_VERSION}"
+		if ! echo "${KERNEL_VERSION}" | grep 'tegra' ; then
+			printf "\nThe on-disk kernel is already custom. You don't need to re-compile (assuming it meets the requirements).\n"
+			CUSTOM_KERNEL=1
+		fi
+
+	fi
+
+	if [ ${CUSTOM_KERNEL} -eq 1 ]; then
+		if prompt_for_verification "Would you like to proceed setting up ${DEV} ?" ; then
+			migrate "${DEV}"
+			exit 0
+		fi
+
+		if ! prompt_for_verification "Would you like to re-compile anyway ?" ; then
+			printf "\nCancelled.\n"
+			exit 0
+		fi
+	fi
+
+
+	exit 0
 
 	KERNEL_SOURCE_PATH="${KERNEL_SOURCE_PATH:-/tmp}"
 	download_kernel_sources "${KERNEL_SOURCE_PATH}"
@@ -255,7 +356,5 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 	# Add an environment variable to enforce skipping the scheck to force kernel re-compile and install.
 	echo "After rebooting source this script and run setup_partion_table && setup_root"
 	set +e
-else
-	echo "Script sourced. Call functions manually."
 fi
 
