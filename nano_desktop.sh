@@ -190,17 +190,22 @@ function setup_partition_table()
 	printf "\nErasing contents of %s\n" "${DEV}"
 	sudo dd if=/dev/zero of="${DEV}" bs=1M count=1 1>/dev/null 2>&1
 
-
 	# Create GPT partition table.
+	printf "\nCreating GPT partition scheme."
 	sudo parted --script "${DEV}" mklabel gpt 1>/dev/null
-	
+
+
+
 	# Create the swap partition (aligned - using 0% as the start makes parted calculate the aligned start sector).
+	printf "\nCreating swap partition."
 	sudo parted --script --align=optimal "${DEV}" mkpart SWAP linux-swap 0% "${SWAP_SIZE_GB}G"
 
 	# Create the root partition (aligned).
-	sudo parted --script --align=optimal "${DEV}" mkpart ROOT ext4 100%
+	printf "\nCreating root partition."
+	sudo parted --script --align=optimal "${DEV}" mkpart ROOT ext4 "${SWAP_SIZE_GB}G" 100%
 
 	# Notify the kernel of partition table change.
+	printf "\nNotifying kernel of new partition table layout.\n"
 	sudo partprobe
 }
 
@@ -363,6 +368,7 @@ function abort()
 if [ -n "${1}" ]; then
 	# https://stackoverflow.com/a/16159057 - credit.
 
+	# Example usage - ./nano_desktop.sh setup_partition_table /dev/sda
 	# Exand the arguments of the command line to try to call the function specified.
 
 	# Check if the function exists (Bash specific).
