@@ -29,6 +29,7 @@ function download_kernel_sources()
 	pushd kernel/kernel-4.9
 }
 
+# Performs kernel patching and configuration.
 function configure_patch_kernel()
 {
 	# Get the current kernel configuration to use as a basis for customization.
@@ -210,6 +211,8 @@ function setup_boot_swap()
 
 # A simple helper to setup the target device.
 function migrate() {
+	DEV="${1}"
+
 	# TODO - detect if the current kernel is the custom one (or at least check the on-disk one
 	# and inform the user they should build the kernel first that supports Zswap.
 	
@@ -228,6 +231,18 @@ function migrate() {
 		exit 1
 	fi
 
+}
+
+# A simple helper to setup the custom kernel.
+function setup_kernel() {
+
+	KERNEL_SOURCE_PATH="${KERNEL_SOURCE_PATH:-/tmp}"
+	download_kernel_sources "${KERNEL_SOURCE_PATH}"
+	
+	configure_patch_kernel
+	build_kernel
+	
+	install_kernel
 }
 
 # Provides an interactive prompt to the user
@@ -299,6 +314,8 @@ if [ -n "${1}" ]; then
 		exit 1
 	fi
 else
+	# TODO get the current shell state off error opt to restore on completion.
+
 	set -e
 
 	trap abort SIGHUP SIGINT SIGTERM
@@ -340,21 +357,20 @@ else
 
 	exit 0
 
-	KERNEL_SOURCE_PATH="${KERNEL_SOURCE_PATH:-/tmp}"
-	download_kernel_sources "${KERNEL_SOURCE_PATH}"
-	
-	configure_patch_kernel
-	build_kernel
-	
-	install_kernel
+	# Download source, patch, configure, compile and install the kernel.
+	setup_kernel
 
-	popd
-	popd
+	# If the user is starting off from the stock kernel proceed to migration after compliation has completed.
+	if [ ${CUSTOM_KERNEL} -eq 0 ]; then
+		if prompt_for_verification "Would you like to proceed setting up ${DEV} ?" ; then
+			migrate "${DEV}"
+			exit 0
+		fi
+	fi
+
 	echo "Done - reboot !"
-
-	# TODO - detect if the custom kernel is installed and run setup root automatically.
-	# Add an environment variable to enforce skipping the scheck to force kernel re-compile and install.
-	echo "After rebooting source this script and run setup_partion_table && setup_root"
+	
+	# TODO restore the original value. Don't assume the script knows best.
 	set +e
 fi
 
