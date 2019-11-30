@@ -61,6 +61,15 @@ function configure_patch_kernel()
 	  sed -i '/CONFIG_EXTRA_FIRMWARE_DIR/c\CONFIG_EXTRA_FIRMWARE_DIR=firmware' .config
 	fi
 
+	# https://www.kernel.org/doc/Documentation/timers/NO_HZ.txt
+
+	# TODO consider altering the CONFIG_HZ from 250 to 1000 for lower latency (we don't care about throughput as much)
+	# Default - CONFIG_PREEMPT=y is already set for  a full pre-emptive kernel.
+	# TODO confirm optimal timer interrupt configuration and tweak.
+       	# Default - CONFIG_NO_HZ_IDLE=y (when the processor is idling, stop sending scheduling-clock interrupts to reduce power (no advantage).
+	# Default - CONFIG_NO_HZ=y 
+	# Default - CONFIG_NO_HZ_COMMON=y	
+	
 	echo "Patching zswap ..."
 	PATCH_SRC=a85f878b443f8d2b91ba76f09da21ac0af22e07f.patch
 	wget "https://github.com/torvalds/linux/commit/${PATCH_SRC}"
@@ -116,48 +125,105 @@ function setup_partition_table()
 	# The maximum swap size to allocate if the percentage specified of the above exceeds this amount to constrain it to.
 	MAX_SWAP_SIZE_GB=8
 	
-	if [ -f "${DEV}" ]; then
+	if stat "${DEV}" 1>/dev/null 2>&1 ; then
 		# TODO handle the case where the device is less than 1GB (G not found). Bail.
-		echo "Calculating partition sizes ..."
-		DISK_SIZE=$(lsblk "${DEV}" --output SIZE | grep -v SIZE | cut -d'G' -f1)
-		
+		printf "\nCalculating partition sizes ...\n"
+		DISK_SIZE_GB=$(lsblk "${DEV}" --output SIZE | grep -v SIZE -m1 | cut -d'G' -f1)
+		DISK_SIZE_GB=$(printf "%.0f" "${DISK_SIZE_GB}")
+
+
 		# Ensure the specified device is large enough to support being a root + swap target.
-		if (( DISK_SIZE < MIN_DISK_SIZE_GB )); then
+		if (( DISK_SIZE_GB < MIN_DISK_SIZE_GB )); then
 			printf "\nThe specified device is too small.%dG is the minimium size supported.\n" "${MIN_DISK_SIZE_GB}"
 			return 1
 		fi
 	else
-		printf "Couldn't find %s.\nAuto-detection not done. Please update script manually for now.\n" "${DEV}"
+		# TODO auto detection.
+		printf "Couldn't find device specified (%s).\nPlease specify a different device.\n" "${DEV}"
 		return 1
+	fi
+
+	# Calculate swap size.
+	SWAP_SIZE_GB=$(echo "${DISK_SIZE_GB}*${ALLOC_SWAP_SIZE_PERCENT}/100" | bc --mathlib)
+
+	# Convert to integers (note - there should be a nicer way of doing this.
+	SWAP_SIZE_GB=$(printf "%.0f" "${SWAP_SIZE_GB}")
+	ROOT_SIZE_GB=$(printf "%.0f" "${ROOT_SIZE_GB}")
+
+
+	# Limit the swap size to 8GB maximum.
+	if (( SWAP_SIZE_GB > ROOT_SIZE_GB )); then
+		printf  "\nUsing %d%% of the disk capacity (%dGB) for swap exceeds the swap size maximum of %dGB.\n" \
+			"${ALLOC_SWAP_SIZE_PERCENT}" "${DISK_SIZE_GB}" "${MAX_SWAP_SIZE_GB}"
+
+		printf "%dGB limit for swap size applied.\n" "${MAX_SWAP_SIZE_GB}"
+		SWAP_SIZE_GB=${MAX_SWAP_SIZE_GB}
+		ROOT_SIZE_GB=$((DISK_SIZE_GB-MAX_SWAP_SIZE_GB))
+	else
+		ROOT_SIZE_GB=$(echo "${DISK_SIZE_GB}*(1-(${ALLOC_SWAP_SIZE_PERCENT})/100)" | bc --mathlib)
+	fi
+
+	SWAP_SIZE_GB=$(printf "%.0f" "${SWAP_SIZE_GB}")
+	ROOT_SIZE_GB=$(printf "%.0f" "${ROOT_SIZE_GB}")
+
+
+	# TODO align column output.
+	printf "\nDetails"
+	printf "\n************\n"
+	printf "\nDevice = %s" "${DEV}"
+	printf "\nDisk capacity = %dGB" "${DISK_SIZE_GB}"
+	printf "\nUsing root size = %dGB\nUsing  swap size = %dGB\n\n" "${ROOT_SIZE_GB}" "${SWAP_SIZE_GB}"
+
+	if ! prompt_for_verification "Would you like to proceed (all contents will be destroyed !) ?" ;then
+		printf "\nCancelled.\n"
+		# TODO - Go through abort function.
+		# Restore original environment value.
+		set +x
+		exit 0
 	fi
 
 
 	# Nuke the current contents.
 	printf "\nErasing contents of %s\n" "${DEV}"
-	sudo dd if=/dev/zero of="${DEV}" bs=1M count=1
+	sudo dd if=/dev/zero of="${DEV}" bs=1M count=1 1>/dev/null 2>&1
 
-	SWAP_SIZE=$(echo "${DISK_SIZE}*${ALLOC_SWAP_SIZE_PERCENT}/100" | bc --mathlib)
-
-	# Limit the swap size to 8GB maximum.
-	if (( $(echo "SWAP_SIZE > SWAP_SIZE_MAX_GB" | bc --mathlib) )); then
-		printf "\nSwap size maxium is %.2fGB. Limit applied.\n" "${MAX_SWAP_SIZE_GB}"
-		SWAP_SIZE=${MAX_SWAP_SIZE_GB}
-		ROOT_SIZE=$((DISK_SIZE-MAX_SWAP_SIZE_GB))
-	else
-		ROOT_SIZE=$(echo "${DISK_SIZE}*(1-(${ALLOC_SWAP_SIZE_PERCENT})/100)" | bc --mathlib)
-	fi
-
-	printf "\nDisk size is %.2fGB\n" "${DISK_SIZE}"
-	printf "\nUsing %.2fGB for root and %.2fGB for swap.\n" "${ROOT_SIZE}" "${SWAP_SIZE}"	
 
 	# Create GPT partition table.
-	sudo parted --script "${DEV}" mklabel gpt
+	sudo parted --script "${DEV}" mklabel gpt 1>/dev/null
 
-	# Create the root partition.
-	sudo parted --script "${DEV}" mkpart primary 0 "${ROOT_SIZE}"
+	# Strip off the device suffix.
+	DEV_NUMBER="$(echo ${DEV} | cut -d'/' -f3)"
 
-	# Create swap.
-	sudo parted --script "${DEV}" "${ROOT_SIZE}" 100%
+	# https://rainbow.chard.org/2013/01/30/how-to-align-partitions-for-best-performance-using-parted/ - credit
+	# Calculate alignment for the new partitions (specifying --align=opt doesn't appear to work)
+	OPTIMAL_IO_SIZE="$(cat /sys/block/${DEV_NUMBER}/queue/optimal_io_size)"
+	
+	if [ -n ${OPTIMAL_IO_SIZE} ]; then
+		MINIMUM_IO_SIZE="$(cat /sys/block/${DEV_NUMBER}/queue/minimum_io_size)"
+		ALIGNMENT_OFFSET="$(cat /sys/block/${DEV_NUMBER}/alignment_offset)"
+		PHYSICAL_BLOCK_SIZE="$(cat /sys/block/${DEV_NUMBER}/queue/physical_block_size)"
+
+		SECTOR_START="$(echo "(${OPTIMAL_IO_SIZE} + ${ALIGNMENT_OFFSET}) / ${PHYSICAL_BLOCK_SIZE}" | bc -l)" 
+		SECTOR_START="$(printf "%.0f" ${SECTOR_START})"
+		printf "\nPartition alignment - optimal sector %d starting offset found - using.\n" "${SECTOR_START}"
+	else
+		SECTOR_START=0
+		printf "\nCouldn't determine optimal alignment for partition. Not aligning.\n"
+	fi	
+
+	set -x
+	# Create the swap partition (aligned).
+	sudo parted --script --align=optimal "${DEV}" mkpart SWAP linux-swap 0% "${SWAP_SIZE_GB}G"
+
+	# Create the root partition (aligned).
+	sudo parted --script --align=optimal "${DEV}" mkpart ROOT ext2 "${SWAP_SIZE_GB}G" 100%
+
+	# Notify the kernel of partition table change.
+	sudo partprobe
+	
+	set +x
+
+	exit 0
 }
 
 
