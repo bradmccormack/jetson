@@ -101,7 +101,7 @@ function install_kernel()
 # Sets up the partition table.
 function setup_partition_table()
 {
-	if [ -n "${1}" ]; then
+	if [ -z "${1}" ]; then
 		printf "No target device specified.\n"
 		return 1
 	fi
@@ -164,7 +164,7 @@ function setup_partition_table()
 # Creates filesystems + sets up root filesystem and swap.
 function setup_filesystem()
 {
-	if [ -n "${1}" ]; then
+	if [ -z "${1}" ]; then
 		printf "No target device specified.\n"
 		return  1
 	fi
@@ -191,7 +191,7 @@ function setup_filesystem()
 # Setups up which root device to boot from and updates the filesystem table to mount zswap.
 function setup_boot_swap()
 {
-	if [ -n "${1}" ]; then
+	if [ -z "${1}" ]; then
 		printf "No target device specified.\n"
 		return 1
 	fi
