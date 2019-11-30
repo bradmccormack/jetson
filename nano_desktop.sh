@@ -5,6 +5,11 @@
 # Inspired by - https://syonyk.blogspot.com/2019/04/nvidia-jetson-nano-desktop-use-kernel-builds.html?m=1
 
 # TODO 
+# - Create usage help such as
+# ./nano_desktop.sh for interactive and automated
+# ./nano_desktop.sh setup_partition_table /dev/sda (for a single function)
+# ./nano_desktop.sh migrate /dev/sda (for a set of operations)
+
 # - Enforce environment variables or arguments or add prompts so options are confirmed / safe and desired by the user.
 # - Improve output
 # - Check after the rsync is complete (basic check of du etc) or consider doing a SHA check on source and dest.
