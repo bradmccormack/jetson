@@ -104,6 +104,11 @@ function build_kernel()
 # Install the kernel + makes a backup of the current kernel.
 function install_kernel()
 {
+	if [ ! -f arch/arm64/boot/Imge ]; then
+		printf "\nKernel not built or in the wrong directory. Please change to the kernel source directory.\n"
+		return 1
+	fi
+
 	# Back up the old kernel.
 	sudo cp /boot/Image /boot/Image.backup
 
@@ -124,6 +129,12 @@ function setup_partition_table()
 	fi
 
 	DEV="${1}"
+	
+	if ! stat "${DEV}" 1>/dev/null 2>&1 ; then
+		printf "\nSpecified device %s doesn't exist !\n" "${DEV}"
+		return 1
+	fi
+	
 	MIN_DISK_SIZE_GB=32
 
 	# The size in percentage to allocate to the swap partition.
@@ -133,21 +144,15 @@ function setup_partition_table()
 	# The maximum swap size to allocate if the percentage specified of the above exceeds this amount to constrain it to.
 	MAX_SWAP_SIZE_GB=8
 	
-	if stat "${DEV}" 1>/dev/null 2>&1 ; then
-		# TODO handle the case where the device is less than 1GB (G not found). Bail.
-		printf "\nCalculating partition sizes ...\n"
-		DISK_SIZE_GB=$(lsblk "${DEV}" --output SIZE | grep -v SIZE -m1 | cut -d'G' -f1)
-		DISK_SIZE_GB=$(printf "%.0f" "${DISK_SIZE_GB}")
+	# TODO handle the case where the device is less than 1GB (G not found). Bail.
+	printf "\nCalculating partition sizes ...\n"
+	DISK_SIZE_GB=$(lsblk "${DEV}" --output SIZE | grep -v SIZE -m1 | cut -d'G' -f1)
+	DISK_SIZE_GB=$(printf "%.0f" "${DISK_SIZE_GB}")
 
 
-		# Ensure the specified device is large enough to support being a root + swap target.
-		if (( DISK_SIZE_GB < MIN_DISK_SIZE_GB )); then
-			printf "\nThe specified device is too small.%dG is the minimium size supported.\n" "${MIN_DISK_SIZE_GB}"
-			return 1
-		fi
-	else
-		# TODO auto detection.
-		printf "Couldn't find device specified (%s).\nPlease specify a different device.\n" "${DEV}"
+	# Ensure the specified device is large enough to support being a root + swap target.
+	if (( DISK_SIZE_GB < MIN_DISK_SIZE_GB )); then
+		printf "\nThe specified device is too small.%dG is the minimium size supported.\n" "${MIN_DISK_SIZE_GB}"
 		return 1
 	fi
 
@@ -187,19 +192,20 @@ function setup_partition_table()
 		# TODO - Go through abort function.
 		# Restore original environment value.
 		set +x
-		exit 0
+		return 1
 	fi
 
 
 	# Nuke the current contents.
 	printf "\nErasing contents of %s\n" "${DEV}"
-	sudo dd if=/dev/zero of="${DEV}" bs=1M count=1 1>/dev/null 2>&1
+	sudo dd if=/dev/zero of="${DEV}" bs=1M count=100 1>/dev/null 2>&1
+
+	# Notify the kernel of partition removal.
+	sudo partprobe
 
 	# Create GPT partition table.
 	printf "\nCreating GPT partition scheme."
 	sudo parted --script "${DEV}" mklabel gpt 1>/dev/null
-
-
 
 	# Create the swap partition (aligned - using 0% as the start makes parted calculate the aligned start sector).
 	printf "\nCreating swap partition."
@@ -224,27 +230,64 @@ function setup_filesystem()
 	fi
 
 	DEV="${1}"
-	
-	# TODO confirm if ext4 is the best for this ARM SOC (Check XFS / JFS etc).
-	printf "Making root filesystem ...\n"
-	sudo mkfs.ext4 -F "${DEV}2"
 
-	printf "Making and mounting swap ...\n"
-	sudo mkswap "${DEV}1"
-	sudo swapon "${DEV}1"
+	if ! stat "${DEV}" 1>/dev/null 2>&1 ; then
+		printf "\nSpecified device %s doesn't exist !\n" "${DEV}"
+		return 1
+	fi
 
-	printf "Mounting filesystems ready for copy ...\n"
-	sudo mkdir -p /mnt/root
-	sudo mount "${DEV}2" /mnt/root
+	# Make and mount swap if not already mounted.
+	if ! mount | grep "${DEV}1" 1>/dev/null ;then
+		printf "Making and mounting swap ...\n"
+		sudo mkswap "${DEV}1"
+		sudo swapon "${DEV}1"
+	else
+		printf "Swap is already mounted for %s. Skipping ...\n" "${DEV}1"
+	fi
 
-	sudo mkdir -p /mnt/root/proc
+	# Make and mount root filesystem if not already mounted.
+	if ! mount | grep "${DEV}2}" 1> /dev/null 2>&1 ; then
+		printf "Making and mounting root filesystem ...\n"
+		# TODO confirm if ext4 is the best for this ARM SOC (Check XFS / JFS etc).
+		sudo mkfs.ext4 "${DEV}2" \
+			&& sudo mkdir -p /mnt/root \
+			&& sudo mount -t ext4 "${DEV}2" /mnt/root
 
+		# Create the proc directory ready for pseudo filesystem. We are excluding it in the rsync.
+		sudo mkdir -p /mnt/root/proc
+	else
+		printf "Root is already mounted for %s. Skipping ...\n" "${DEV}2"
+	fi
+}
+
+function sync_root()
+{
 	# Sync the current root file system onto the new device.
 	if ! which rsync; then
 		sudo apt -y install rsync 1>/dev/null
 	fi
-	
-	sudo rsync -axHAWX --numeric-ids --info=progress2 --exclude=/proc / /mnt/root
+
+	if ! mount | grep /mnt/root ;then
+		printf "The target root filesystem doesn't appear to be mounted. Cannot rsync.\n"
+		return 1
+	fi
+
+	# Get the absolute path to this Git repo.
+	GIT_ROOT="$(git rev-parse --show-toplevel)"
+
+	# TODO - determine other places to exclude or include
+	# Rsync the current root (excluding the pseudo filesystem + the current Git root.
+	printf "\nSyncing the root from MMC to %s ...\n" "${DEV}2"
+	sudo rsync \
+		--recursive \
+		--executability \
+		--acls \
+		--archive \
+		--xattrs \
+		--quiet \
+		--exclude={"/dev/*","/proc/*","/sys/*","/tmp/*","/run/*","/mnt/*","/media/*","/lost+found","${GIT_ROOT}"} \
+		/ \
+		/mnt/root
 }
 
 # Setups up which root device to boot from and updates the filesystem table to mount zswap.
@@ -256,6 +299,11 @@ function setup_boot_swap()
 	fi
 
 	DEV="${1}"
+
+	if ! stat "${DEV}" 1>/dev/null 2>&1 ; then
+		printf "\nSpecified device %s doesn't exist !\n" "${DEV}"
+		return 1
+	fi
 
 	# Note triple check everything before enabling this as future booting will not work if I break it.
 	#sudo sed -i "s/mmcblk0p1/${DEV}2/" /boot/extlinux/extlinux.conf
@@ -273,6 +321,11 @@ function setup_boot_swap()
 function migrate() {
 	DEV="${1}"
 
+	if ! stat "${DEV}" 1>/dev/null 2>&1 ; then
+		printf "\nSpecified device %s doesn't exist !\n" "${DEV}"
+		exit 0
+	fi
+
 	# TODO - detect if the current kernel is the custom one (or at least check the on-disk one
 	# and inform the user they should build the kernel first that supports Zswap.
 	
@@ -285,6 +338,12 @@ function migrate() {
 		echo "Couldn't set up filesystems. Cancelled."
 		exit 1
 	fi
+
+	if ! sync_root ; then
+		echo "Couldn't sync root filesystem. Cancelled."
+		exit 1
+	fi
+
 
 	if ! setup_boot_swap "${DEV}" ; then
 		echo "Couldn't set up boot and mount configuration. Cancelled."
@@ -352,20 +411,24 @@ function abort()
 	fi
 
 	# TODO sigterm all child processes so we don't leave mess.
-	sudo kill $(ps -s $$ -o pid=)
+	sudo kill "$(ps -s $$ -o pid=)"
 
 	# Attempt to cleanly kill any stray rsync processes
 	# TODO - ensure that we are the parent of them so we don't kill rsync started by another app.
-	#sudo kill -s SIGTERM $(pidof rsync)
-	#sleep 1
+	sudo kill -s SIGTERM "$(sudo pidof rsync)"
+	sleep 1
 	# Kill any remaining.
-	#sudo kill -s SIGKILL $(pidof rsync)
+	sudo kill -s SIGKILL "$(sudo pidof rsync)"
 
 
 	# TODO get the original state of the error option and don't just assume this script knows best.
 	set +e
 	echo "Aborted."
 }
+
+
+# Regardless of the parts of this script that are executed, we want to ensure that we cleanup stray processes such as rsync.
+trap abort SIGHUP SIGINT SIGTERM
 
 # Check if the script is being executed with arguments or not.
 
@@ -389,8 +452,6 @@ else
 	# TODO get the current shell state off error opt to restore on completion.
 
 	set -e
-
-	trap abort SIGHUP SIGINT SIGTERM
 
 	CUSTOM_KERNEL=0
 	
