@@ -9,6 +9,7 @@
 # - Make the Jetson desktop script I've created use this
 # - Make the Jetson desktop script set the optimal values for vm.swappiness and vm.vfs_cache_pressure
 # - Consider adding the zswap entries to /etc/fstab
+# - Do I have do do anything to use this for other stuff such as /tmp? I suppose mounting /tmp on tmpfs will work. If memory becomes low it will page in/out with zram anyway.
 
 # Determine the arguments to use for zram probing depending on the zram version available.
 ARGS=$(modinfo zram | grep parm | cut -d':' -f2 | tr -d ' ')
@@ -48,9 +49,29 @@ for i in $(seq "${CORES}"); do
 
 	# Set zram size and compression algorithm.
 	echo "${ZRAM_MEMORY_SIZE_KB}" > "/sys/block/zram${CORE_IDX}/disksize"
-	echo lz4 > /sys/block/zram${CORE_IDX}/comp_algorithm
 
-	# Log to system log
+	# TODO come from key value file or JSON via jq.
+	COMP_ALGO=lzo
+	
+	# The default (on my setup) was lzo. From what I could find lzo is much slower for decompression.
+	# e.g https://catchchallenger.first-world.info/wiki/Quick_Benchmark:_Gzip_vs_Bzip2_vs_LZMA_vs_XZ_vs_LZ4_vs_LZO 0.4s (lz4) vs 1.5s (lzo)
+	# On the link above, lzo did use a LOT less memory though. 0.7MB (lzo) vs 12MB (lz4).
+	#
+	# Why did Nvidia choose this value (or is it the default for this module)?
+	# Find out the best algorithm for the Jetson Nano and put it here. In the link above, lzo-rle is up to 30% faster than lzo. Add run length encoding version to my kernel.
+
+	# Detect available compression algorithms and ensure that the requested algorithm is supported. If not, fall back to lzo.
+	# AVAILABLE_COMP_ALGO=$(</proc/kallsyms cut -d " " -f 3 | grep -xF -e gunzip -e bzip2 -e unlzma -e unxz -e unlzo -e unlz4 -e std)
+	# Example output.
+	# gunzip
+	# unlz4
+	# unlzma
+	# unlzo
+	# unxz
+
+	logger "Setting zram (de)compression algorithm to ${COMP_ALGO}"
+	echo "${COMP_ALGO}" > /sys/block/zram${CORE_IDX}/comp_algorithm
+
 	logger "Creating zram swap device ${SWAP_DEVICE} ..."
 	mkswap "${SWAP_DEVICE}" --label "zram${CORE_IDX}" --force --pagesize ${ZRAM_MEMORY_SIZE}
 		
@@ -68,7 +89,6 @@ for i in $(seq "${CORES}"); do
 	fi
 
 	logger -s "Swap device ${SWAP_DEVICE} enabled."
-
 done
 
 set +x
