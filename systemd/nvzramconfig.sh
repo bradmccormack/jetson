@@ -73,7 +73,12 @@ for i in $(seq "${CORES}"); do
 	echo "${COMP_ALGO}" > /sys/block/zram${CORE_IDX}/comp_algorithm
 
 	logger "Creating zram swap device ${SWAP_DEVICE} ..."
-	mkswap "${SWAP_DEVICE}" --label "zram${CORE_IDX}" --force --pagesize ${ZRAM_MEMORY_SIZE}
+	PAGE_SIZE_BYTES=$((ZRAM_MEMORY_SIZE_KB * 1024))
+
+
+	mkswap "${SWAP_DEVICE}" --label "zram${CORE_IDX}" --force
+	# Page size below errors out with out of range. Seems correct to me ..
+	#mkswap "${SWAP_DEVICE}" --label "zram${CORE_IDX}" --force --pagesize ${PAGE_SIZE_BYTES}
 		
 	# TODO read from key value file or JSON via jq.
 	PRIORITY=5
